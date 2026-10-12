@@ -38,6 +38,11 @@
 #define IDM_MULTIINST   0x0320
 #define IDM_TABNEXT     0x0330
 #define IDM_TABPREV     0x0340
+#define IDM_VIEWSESSION 0x0350
+#define IDM_VIEW_MAX    20
+#define IDM_VIEW_STEP   10
+
+static void build_view_menu(HMENU menu);
 
 #define FRAME_CLASS_NAMEA "PuTTYFrame"
 #define FRAME_CLASS_NAMEW L"PuTTYFrame"
@@ -50,6 +55,12 @@ static HWND tab_ctrl = NULL;
 static WNDPROC tab_ctrl_oldproc = NULL;
 static HMENU frame_savedsess_menu = NULL;
 static bool frame_closing_all = false;
+
+/* Fullscreen state for the frame window. */
+static bool frame_fullscreen = false;
+static RECT frame_pre_fs_rect;
+static void tabframe_layout(void);
+static HMENU frame_view_menu = NULL;
 static WinGuiSeat *active_wgs = NULL;
 
 /* Tab drag-reorder state. */
@@ -312,6 +323,33 @@ static void rebuild_savedsess_menu(HMENU menu)
         AppendMenu(menu, MF_GRAYED, IDM_SAVED_MIN, "(No sessions)");
 }
 
+static void build_view_menu(HMENU menu)
+{
+    if (!menu)
+        return;
+
+    int n = TabCtrl_GetItemCount(tab_ctrl);
+    int i;
+    for (i = 0; i < n && i < IDM_VIEW_MAX; i++) {
+        wchar_t *wlabel = tab_label(i);
+        char label[128];
+        WideCharToMultiByte(CP_UTF8, 0, wlabel, -1, label, 128, NULL, NULL);
+        sfree(wlabel);
+        char *item = dupprintf("%d: %s", i+1, label);
+        if (i == TabCtrl_GetCurSel(tab_ctrl))
+            CheckMenuItem(menu, IDM_VIEWSESSION + IDM_VIEW_STEP * i,
+                          MF_CHECKED | MF_BYCOMMAND);
+        else
+            CheckMenuItem(menu, IDM_VIEWSESSION + IDM_VIEW_STEP * i,
+                          MF_UNCHECKED | MF_BYCOMMAND);
+        AppendMenu(menu, MF_STRING | MF_ENABLED,
+                   IDM_VIEWSESSION + IDM_VIEW_STEP * i, item);
+        sfree(item);
+    }
+    if (n == 0)
+        AppendMenu(menu, MF_STRING | MF_GRAYED, IDM_VIEWSESSION, "(no sessions)");
+}
+
 static bool multiple_instances_setting(void)
 {
     HKEY key = open_regkey_fn(false, false, HKEY_CURRENT_USER,
@@ -336,6 +374,55 @@ static void set_multiple_instances_setting(bool value)
     }
 }
 
+/* Frame-level fullscreen: expand frame window to fill monitor,
+ * remove title bar/borders. */
+static void frame_toggle_fullscreen(void)
+{
+    if (!frame_hwnd)
+        return;
+
+    if (frame_fullscreen) {
+        /* Exit fullscreen: restore previous state. */
+        DWORD style = GetWindowLongPtr(frame_hwnd, GWL_STYLE);
+        style &= ~(WS_BORDER | WS_DLGFRAME);
+        style |= WS_CAPTION | WS_THICKFRAME;
+        SetWindowLongPtr(frame_hwnd, GWL_STYLE, style);
+        SetWindowPos(frame_hwnd, HWND_TOP,
+                     frame_pre_fs_rect.left, frame_pre_fs_rect.top,
+                     frame_pre_fs_rect.right - frame_pre_fs_rect.left,
+                     frame_pre_fs_rect.bottom - frame_pre_fs_rect.top,
+                     SWP_FRAMECHANGED);
+        frame_fullscreen = false;
+    } else {
+        /* Enter fullscreen: save state, expand to monitor. */
+        GetWindowRect(frame_hwnd, &frame_pre_fs_rect);
+
+        /* Resize to fill primary monitor. */
+        HMONITOR mon = MonitorFromWindow(frame_hwnd,
+                                         MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi;
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfo(mon, &mi)) {
+            SetWindowPos(frame_hwnd, HWND_TOP, mi.rcMonitor.left,
+                         mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_FRAMECHANGED);
+        }
+
+        /* Remove title bar and all borders. */
+        DWORD style = GetWindowLongPtr(frame_hwnd, GWL_STYLE);
+        style &= ~(WS_CAPTION | WS_BORDER | WS_THICKFRAME);
+        SetWindowLongPtr(frame_hwnd, GWL_STYLE, style);
+        SetWindowPos(frame_hwnd, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+        frame_fullscreen = true;
+    }
+
+    /* Layout children to fill new frame size. */
+    tabframe_layout();
+}
+
 void tabframe_refresh_menu(void)
 {
     if (!frame_hwnd)
@@ -347,29 +434,33 @@ void tabframe_refresh_menu(void)
     HMENU session_menu = CreatePopupMenu();
     AppendMenu(session_menu, MF_ENABLED, IDM_NEWSESS, "&New Session...");
     AppendMenu(session_menu, active_wgs ? MF_ENABLED : MF_GRAYED,
-               IDM_DUPSESS, "&Duplicate Session");
+               IDM_DUPSESS, "&Duplicate session");
     if (active_wgs && active_wgs->session_closed)
         AppendMenu(session_menu, MF_ENABLED, IDM_RESTART, "&Restart Session");
-    AppendMenu(session_menu, MF_SEPARATOR, 0, 0);
-    HMENU specials = build_specials_submenu(active_wgs);
-    if (specials) {
-        AppendMenu(session_menu, MF_POPUP | MF_ENABLED, (UINT_PTR) specials,
-                   "S&pecial Command");
-        AppendMenu(session_menu, MF_SEPARATOR, 0, 0);
-    }
     AppendMenu(session_menu, active_wgs ? MF_ENABLED : MF_GRAYED,
                IDM_CLOSESESS, "Close &Session");
     AppendMenu(session_menu, MF_SEPARATOR, 0, 0);
+    AppendMenu(session_menu, active_wgs ? MF_ENABLED : MF_GRAYED,
+               IDM_FULLSCREEN, "&Full Screen");
+    AppendMenu(session_menu, active_wgs ? MF_ENABLED : MF_GRAYED,
+               IDM_RECONF, "Chan&ge Settings...");
     AppendMenu(session_menu,
                MF_STRING | (multiple_instances_setting() ? MF_CHECKED :
                             MF_UNCHECKED),
                IDM_MULTIINST, "&Multiple instances");
-    AppendMenu(session_menu, MF_SEPARATOR, 0, 0);
     AppendMenu(session_menu, active_wgs ? MF_ENABLED : MF_GRAYED,
                IDM_SHOWLOG, "&Event Log");
+    AppendMenu(session_menu, MF_SEPARATOR, 0, 0);
     AppendMenu(session_menu, MF_ENABLED, IDM_EXIT, "E&xit");
     AppendMenu(bar, MF_POPUP | MF_ENABLED, (UINT_PTR) session_menu,
                "&Session");
+
+
+    /* --- Command --- */
+    HMENU cmd_menu = build_specials_submenu(active_wgs);
+    if (cmd_menu)
+        AppendMenu(bar, MF_POPUP | MF_ENABLED, (UINT_PTR) cmd_menu,
+                   "&Command");
 
     /* --- Saved --- */
     /*
@@ -380,7 +471,7 @@ void tabframe_refresh_menu(void)
     HMENU savedsess_menu = CreatePopupMenu();
     rebuild_savedsess_menu(savedsess_menu);
     AppendMenu(bar, MF_POPUP | MF_ENABLED, (UINT_PTR) savedsess_menu,
-               "Sa&ved");
+               "Si&tes");
     /* Remembered only so WM_INITMENUPOPUP can recognise this menu; it
      * is destroyed along with the old bar a few lines below, and
      * replaced by a new one on the next refresh. */
@@ -389,10 +480,19 @@ void tabframe_refresh_menu(void)
     /* --- Edit --- */
     HMENU edit_menu = CreatePopupMenu();
     unsigned enabled = active_wgs ? MF_ENABLED : MF_GRAYED;
+    AppendMenu(edit_menu, enabled, IDM_COPY, "&Copy");
     AppendMenu(edit_menu, enabled, IDM_COPYALL, "Copy &All");
+    AppendMenu(edit_menu, enabled, IDM_PASTE, "&Paste");
+    AppendMenu(edit_menu, MF_SEPARATOR, 0, 0);
     AppendMenu(edit_menu, enabled, IDM_CLRSB, "C&lear Scrollback");
     AppendMenu(edit_menu, enabled, IDM_RESET, "Rese&t Terminal");
     AppendMenu(bar, MF_POPUP | MF_ENABLED, (UINT_PTR) edit_menu, "&Edit");
+
+    /* --- View --- */
+    HMENU view_menu = CreatePopupMenu();
+    build_view_menu(view_menu);
+    AppendMenu(bar, MF_POPUP | MF_ENABLED, (UINT_PTR) view_menu, "&View");
+    frame_view_menu = view_menu;
 
     /* --- Help --- */
     HMENU help_menu = CreatePopupMenu();
@@ -420,7 +520,7 @@ static void tabframe_layout(void)
     RECT rc;
     GetClientRect(frame_hwnd, &rc);
     int n = TabCtrl_GetItemCount(tab_ctrl);
-    int tabh = n > 1 ? TAB_STRIP_HEIGHT : 0;
+    int tabh = frame_fullscreen ? 0 : (n > 1 ? TAB_STRIP_HEIGHT : 0);
     ShowWindow(tab_ctrl, tabh ? SW_SHOW : SW_HIDE);
     MoveWindow(tab_ctrl, 0, 0, rc.right, TAB_STRIP_HEIGHT, TRUE);
 
@@ -795,6 +895,8 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
           case IDM_MULTIINST:
             set_multiple_instances_setting(!multiple_instances_setting());
             tabframe_refresh_menu();
+          case IDM_FULLSCREEN:
+            frame_toggle_fullscreen();
             return 0;
           case IDM_TABNEXT:
           case IDM_TABPREV:
@@ -806,6 +908,17 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                         (sel + 1) % n : (sel + n - 1) % n;
                     TabCtrl_SetCurSel(tab_ctrl, next);
                     WinGuiSeat *wgs = session_at(next);
+                    if (wgs)
+                        tabframe_activate_session(wgs);
+                }
+            }
+            return 0;
+          case IDM_VIEWSESSION:
+            {
+                int idx = (wParam - IDM_VIEWSESSION) / IDM_VIEW_STEP;
+                if (idx >= 0) {
+                    TabCtrl_SetCurSel(tab_ctrl, idx);
+                    WinGuiSeat *wgs = session_at(idx);
                     if (wgs)
                         tabframe_activate_session(wgs);
                 }
