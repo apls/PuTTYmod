@@ -17,6 +17,11 @@
 #include "win-gui-seat.h"
 
 #include <windows.h>
+/* Not declared in the VC2003 SDK headers. */
+#ifdef __cplusplus
+extern "C"
+#endif
+BOOL WINAPI AllowSetForegroundWindow(DWORD dwProcessId);
 #include <windowsx.h>
 #include <commctrl.h>
 
@@ -60,6 +65,7 @@ static bool frame_closing_all = false;
 static bool frame_fullscreen = false;
 static RECT frame_pre_fs_rect;
 static void tabframe_layout(void);
+static void frame_focus_active(void);
 static HMENU frame_view_menu = NULL;
 static WinGuiSeat *active_wgs = NULL;
 
@@ -354,7 +360,7 @@ static bool multiple_instances_setting(void)
 {
     HKEY key = open_regkey_fn(false, false, HKEY_CURRENT_USER,
                               "Software", "SimonTatham", "PuTTY", NULL);
-    bool value = true;
+    bool value = false;
     if (key) {
         DWORD d;
         if (get_reg_dword(key, "MultipleInstances", &d))
@@ -564,6 +570,7 @@ void tabframe_activate_session(WinGuiSeat *wgs)
     TabCtrl_SetCurSel(tab_ctrl, idx);
     winselgui_set_hwnd(wgs->term_hwnd);
     SetFocus(wgs->term_hwnd);
+    frame_focus_active();
     term_set_focus(wgs->term, true);
 
     tabframe_refresh_menu();
@@ -646,8 +653,13 @@ void tabframe_remove_session(WinGuiSeat *wgs)
                     break;
                 }
             }
-            if (next)
+            if (next) {
                 tabframe_activate_session(next);
+                /* Win7: force focus onto the new tab before the old
+                 * window is destroyed, or the frame keeps focus and
+                 * the remaining tabs go deaf to the keyboard. */
+                frame_focus_active();
+            }
         } else {
             tabframe_refresh_menu();
         }
@@ -794,11 +806,56 @@ static void frame_close_all_sessions(void)
     active_wgs = NULL;
 }
 
+/*
+ * Bring the frame to the front even where the OS foreground lock
+ * rejects a plain SetForegroundWindow: Windows 7 and later grant the
+ * foreground only to the process that received the last input event.
+ * Restoring a minimised window goes through the shell and earns the
+ * right; otherwise grant it to ourselves and inject an ALT keypress,
+ * which the input system counts as a user input event.
+ */
+static void frame_ensure_foreground(void)
+{
+    if (!frame_hwnd || !IsWindow(frame_hwnd))
+        return;
+    if (IsIconic(frame_hwnd)) {
+        ShowWindow(frame_hwnd, SW_RESTORE);
+    } else {
+        AllowSetForegroundWindow(GetCurrentProcessId());
+        keybd_event(VK_MENU, 0, 0, 0);
+        keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    }
+    SetForegroundWindow(frame_hwnd);
+}
+
+/*
+ * Make the active session's terminal window the keyboard focus.
+ * Windows 7 rejects SetFocus from a process that is not allowed to
+ * take the foreground, and the shell revokes that allowance when it
+ * re-resolves focus after a tab window is destroyed, so a plain
+ * SetFocus can leave the frame holding focus: the terminal then never
+ * sees the keyboard. Re-claim the allowance and retry.
+ */
+static void frame_focus_active(void)
+{
+    if (!active_wgs || !active_wgs->term_hwnd ||
+        !IsWindow(active_wgs->term_hwnd) ||
+        !IsWindowVisible(active_wgs->term_hwnd))
+        return;
+    if (GetFocus() != active_wgs->term_hwnd) {
+        AllowSetForegroundWindow(GetCurrentProcessId());
+        SetFocus(active_wgs->term_hwnd);
+    }
+}
+
 static void session_open_cb(void *vctx)
 {
     char *cmdline = (char *)vctx;
     session_open_from_cmdline(cmdline);
     sfree(cmdline);
+    /* Re-assert foreground now that the new tab exists, so the window
+     * ends up in front even if the earlier attempt raced the tab. */
+    frame_ensure_foreground();
 }
 
 static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
@@ -815,9 +872,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
         return 0;
 
       case WM_SETFOCUS:
-        if (active_wgs && active_wgs->term_hwnd &&
-            IsWindow(active_wgs->term_hwnd))
-            SetFocus(active_wgs->term_hwnd);
+        frame_focus_active();
         return 0;
 
       case WM_SIZE:
@@ -895,6 +950,7 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
           case IDM_MULTIINST:
             set_multiple_instances_setting(!multiple_instances_setting());
             tabframe_refresh_menu();
+            return 0;
           case IDM_FULLSCREEN:
             frame_toggle_fullscreen();
             return 0;
@@ -948,9 +1004,9 @@ static LRESULT CALLBACK FrameWndProc(HWND hwnd, UINT message,
                 memcpy(cmdline, cds->lpData, cds->cbData);
                 cmdline[cds->cbData - 1] = '\0';
                 queue_toplevel_callback(session_open_cb, cmdline);
+                frame_ensure_foreground();
+                return TRUE;
             }
-            SetForegroundWindow(hwnd);
-            return TRUE;
         }
 
       case WM_CLOSE:
